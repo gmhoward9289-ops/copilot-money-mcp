@@ -175,12 +175,20 @@ Phase 2 built an in-memory list of all findings. Phase 3 presents a batch from t
 
 **Per-batch loop:**
 
-1. **Apply MCP writes — group by target, one bulk call each.**
-   - Recategorize: group the approved transactions by target category and issue **one `bulk_edit_transactions(transaction_ids=[...], category_id=...)` call per category**. A cleanup pass usually moves many transactions to the same few categories, so this collapses dozens of calls into a handful. Fall back to `update_transaction` per row only when each row needs a *different* edit, or when the edit touches `name`, `note`, `date` or `amount` — those are not bulk-editable.
-   - New recurrings: `create_recurring` for merchants the user confirms as recurring.
-   - Mark reviewed: `review_transactions` for cleaned-up transactions.
-   - Transfer fixes: `update_transaction` to change category to/from Internal Transfer.
+1. **Apply MCP writes — batch them; never loop one call per transaction.**
+   - **Same change across many rows** (recategorize a merchant, flip a batch to Internal Transfer): group by target and issue **one `bulk_edit_transactions(transaction_ids=[...], category_id=... | type=...)` call per group**. One request each, max 500 rows.
+   - **Different change per row, or edits touching `name`/`note`/`date`/`amount`**: **one `update_transactions` call** with an `edits` entry per transaction (max 200; chunk beyond that). Those four fields are **not** bulk-editable by Copilot, so they can only go through this path. It fans out one request per row but still costs a single agent turn.
+   - Do NOT loop `update_transaction` — that costs one agent turn per row, which is how a routine cleanup turns into an hours-long run that exhausts the context budget.
+   - Mark reviewed: `review_transactions` for cleaned-up transactions (bulk; takes an array).
+   - New recurrings: `create_recurring` per merchant the user confirms as recurring.
    - Matcher rule fixes: `update_recurring` per Phase 2.4.
+
+   **Bulk-write rules:**
+   - Max 200 edits per `update_transactions` call — chunk anything larger.
+   - One entry per transaction. If a batch would edit the same transaction twice, merge the fields into a single entry; duplicates are rejected.
+   - Validation is all-or-nothing: a bad `category_id` anywhere fails the whole call before any write lands. Fix the entry and re-issue — nothing was half-applied.
+   - Pass `continue_on_error: true` for backlog sweeps where a few unwritable rows (e.g. outside the 13-month write window) shouldn't strand the rest; read `failures[]` and report them. Leave it off when the batch is a coherent unit.
+   - Reserve single `update_transaction` calls for genuine one-offs.
 
 2. **Update profile sections relevant to this batch** (incremental, per-batch — do NOT defer to Phase 5):
    - `update_recurring` succeeded → append the new rule to the "Recurring Matcher State" section of `~/.claude/copilot-money/user-profile.md`.

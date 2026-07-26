@@ -419,7 +419,9 @@ export const updateTransactionTool = defineTool({
       '(Copilot does this server-side), so category_id cannot be combined with those two types — ' +
       'pass the type alone, or use REGULAR to keep/set a category. `reviewed` marks a single ' +
       'transaction reviewed (true) or un-reviewed (false), and can be set inline with other edits ' +
-      '— use review_transactions instead for bulk/filter-based review. At least one mutable field ' +
+      '— use review_transactions instead for bulk/filter-based review. To edit MANY transactions, ' +
+      'use update_transactions (plural) — it takes an array of these same edits in one call ' +
+      'instead of one call per row. At least one mutable field ' +
       'must be provided besides transaction_id. If the transaction cannot be resolved locally ' +
       '(outside the resolution window), pass account_id and item_id (from a live read) to write ' +
       "anyway. `date` corrects the transaction's date (YYYY-MM-DD); on a synced bank transaction " +
@@ -505,6 +507,119 @@ export const updateTransactionTool = defineTool({
   },
   readOnly: false,
   handler: (ctx, args) => ctx.tools.updateTransaction(args as ToolMethodArgs<'updateTransaction'>),
+});
+
+/**
+ * Per-edit property schema, shared by the array items below. Mirrors
+ * update_transaction's own properties minus the prose that only makes sense
+ * for a single row.
+ */
+const BULK_EDIT_ITEM_PROPERTIES = {
+  transaction_id: {
+    type: 'string',
+    description: 'Transaction ID to update (from get_transactions results)',
+  },
+  account_id: {
+    type: 'string',
+    description:
+      'Optional. Account ID the transaction belongs to (from a live read). Pass together with ' +
+      'item_id to skip local resolution and edit a transaction outside the resolution window.',
+  },
+  item_id: {
+    type: 'string',
+    description:
+      "Optional. Item ID the account belongs to (Copilot's Firestore item_id, from a live read). " +
+      'Pass together with account_id.',
+  },
+  name: { type: 'string', description: 'New display name. Must not be empty.' },
+  category_id: {
+    type: 'string',
+    description: 'New category ID to assign (from get_categories results)',
+  },
+  note: { type: 'string', description: 'User note text. Pass empty string to clear.' },
+  tag_ids: {
+    type: 'array',
+    items: { type: 'string' },
+    description: 'Tag IDs to set. Pass empty array to clear all tags.',
+  },
+  type: {
+    type: 'string',
+    enum: ['REGULAR', 'INCOME', 'INTERNAL_TRANSFER'],
+    description:
+      'High-level classification. INCOME/INTERNAL_TRANSFER clear the category server-side — ' +
+      'do not pass category_id with them.',
+  },
+  reviewed: { type: 'boolean', description: 'Mark this transaction reviewed/un-reviewed.' },
+  date: {
+    type: 'string',
+    description:
+      'New transaction date in YYYY-MM-DD. May be reverted by the next institution sync on a ' +
+      'synced (non-manual) transaction.',
+  },
+  amount: {
+    type: 'number',
+    description:
+      "New signed amount, using Copilot's stored sign (income is negative). May be reverted by " +
+      'the next institution sync on a synced (non-manual) transaction.',
+  },
+} as const;
+
+export const updateTransactionsTool = defineTool({
+  schema: {
+    name: 'update_transactions',
+    description:
+      'Apply many independent transaction edits in ONE call — the bulk form of update_transaction. ' +
+      'Use this whenever you are editing more than one transaction (recategorizing a merchant ' +
+      'across months, applying a cleanup batch, retagging a trip): one call of 50 edits replaces ' +
+      '50 calls. Each entry in `edits` takes the same fields as update_transaction ' +
+      '(transaction_id plus any of name, category_id, note, tag_ids, type, reviewed, date, ' +
+      'amount), and each is validated identically — including the rule that category_id cannot ' +
+      'be combined with type INCOME or INTERNAL_TRANSFER. Entries are independent: different ' +
+      'transactions may change different fields. Two entries for the SAME transaction_id are ' +
+      'rejected — combine them into one entry. Max 200 edits per call; split larger jobs. ' +
+      'ALL validation and ID resolution happen before the first write, so a malformed entry ' +
+      'anywhere in the batch fails the call without writing anything. Writes then go out via ' +
+      'GraphQL with a cap of 5 in flight. `continue_on_error` (default false) controls write ' +
+      'failures only: false stops the batch at the first failure and throws with a count of what ' +
+      'succeeded; true attempts every edit and returns the failures in `failures[]`. Either way ' +
+      '`updated_count` and `results[]` reflect exactly what was written, so retry the failures ' +
+      'rather than the whole batch. For marking many transactions reviewed and nothing else, ' +
+      'review_transactions is cheaper.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        edits: {
+          type: 'array',
+          description:
+            'The edits to apply, one entry per transaction. Non-empty, max 200, no duplicate ' +
+            'transaction_ids.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: BULK_EDIT_ITEM_PROPERTIES,
+            required: ['transaction_id'],
+          },
+        },
+        continue_on_error: {
+          type: 'boolean',
+          description:
+            'When true, attempt every edit and report per-entry write failures in `failures[]` ' +
+            'instead of stopping at the first one. Defaults to false. Does not affect validation ' +
+            'errors, which always fail the whole call before any write.',
+        },
+      },
+      required: ['edits'],
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+    },
+  },
+  readOnly: false,
+  handler: (ctx, args) =>
+    ctx.tools.updateTransactions(args as ToolMethodArgs<'updateTransactions'>),
 });
 
 export const reviewTransactionsTool = defineTool({
