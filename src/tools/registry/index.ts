@@ -16,6 +16,7 @@ import {
   addTransactionToRecurringTool,
   splitTransactionTool,
   updateTransactionTool,
+  updateTransactionsTool,
   reviewTransactionsTool,
 } from './transactions.js';
 import {
@@ -128,6 +129,7 @@ export const WRITE_TOOL_DEFS: readonly ToolDefinition[] = [
   addTransactionToRecurringTool,
   splitTransactionTool,
   updateTransactionTool,
+  updateTransactionsTool,
   reviewTransactionsTool,
   createTagTool,
   deleteTagTool,

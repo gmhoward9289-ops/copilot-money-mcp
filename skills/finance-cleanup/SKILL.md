@@ -175,12 +175,18 @@ Phase 2 built an in-memory list of all findings. Phase 3 presents a batch from t
 
 **Per-batch loop:**
 
-1. **Apply MCP writes.**
-   - Recategorize: `update_transaction` per transaction (set `categoryId` to the user-created category).
-   - New recurrings: `create_recurring` for merchants the user confirms as recurring.
-   - Mark reviewed: `review_transactions` for cleaned-up transactions.
-   - Transfer fixes: `update_transaction` to change category to/from Internal Transfer.
+1. **Apply MCP writes — one bulk call per batch, not one call per transaction.**
+   - Recategorize + transfer fixes + renames + notes: **one `update_transactions` call** carrying every approved edit in the batch as an entry in `edits` (each entry sets `category_id`, `name`, `note`, `type`, etc. as needed). Do NOT loop `update_transaction` — that costs one agent turn per row, which is how a routine cleanup turns into an hours-long run that exhausts the context budget.
+   - Mark reviewed: `review_transactions` for cleaned-up transactions (bulk; takes an array).
+   - New recurrings: `create_recurring` per merchant the user confirms as recurring.
    - Matcher rule fixes: `update_recurring` per Phase 2.4.
+
+   **Bulk-write rules:**
+   - Max 200 edits per `update_transactions` call — chunk anything larger.
+   - One entry per transaction. If a batch would edit the same transaction twice, merge the fields into a single entry; duplicates are rejected.
+   - Validation is all-or-nothing: a bad `category_id` anywhere fails the whole call before any write lands. Fix the entry and re-issue — nothing was half-applied.
+   - Pass `continue_on_error: true` for backlog sweeps where a few unwritable rows (e.g. outside the 13-month write window) shouldn't strand the rest; read `failures[]` and report them. Leave it off when the batch is a coherent unit.
+   - Reserve single `update_transaction` calls for genuine one-offs.
 
 2. **Update profile sections relevant to this batch** (incremental, per-batch — do NOT defer to Phase 5):
    - `update_recurring` succeeded → append the new rule to the "Recurring Matcher State" section of `~/.claude/copilot-money/user-profile.md`.

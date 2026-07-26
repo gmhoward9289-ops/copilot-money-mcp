@@ -24,6 +24,7 @@
     "tests/integration/tools.test.ts",
     "tests/tools/optimistic-cache.test.ts",
     "tests/tools/review-transactions-batching.test.ts",
+    "tests/tools/update-transactions-batching.test.ts",
     "tests/tools/tools.test.ts",
     "tests/tools/unit-coverage-gaps.test.ts",
     "tests/tools/write-tools-phase3.test.ts",
