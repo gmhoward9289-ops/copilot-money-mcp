@@ -29,6 +29,7 @@ import {
   type BulkEditTransactionsResult,
   type CreatedTransaction,
   type CreateTransactionInput,
+  type EditTransactionInput,
   type TransactionType,
   TRANSACTION_TYPES,
 } from '../core/graphql/transactions.js';
@@ -67,6 +68,7 @@ import {
   type ScheduledSmokeStatus,
 } from '../utils/scheduled-smoke-status.js';
 import { computeTotalReturnPercent, roundAmount } from '../utils/round.js';
+import { pLimit } from '../utils/concurrency.js';
 import {
   getCategoryName,
   isTransferCategory,
@@ -331,6 +333,149 @@ const MAX_BULK_EDIT_TARGETS = 500;
 
 function filterSplitParents<T extends { children_transaction_ids?: string[] }>(txns: T[]): T[] {
   return txns.filter((t) => !t.children_transaction_ids || t.children_transaction_ids.length === 0);
+}
+
+/**
+ * One transaction edit — the payload shape shared by `update_transaction`
+ * (exactly one) and `update_transactions` (an array of them). Both tools run
+ * the same validation, the same field→GraphQL mapping, and the same optimistic
+ * cache patch; the only difference is arity. Keep them that way: a field that
+ * lands on one tool and not the other is the drift this shared type exists to
+ * prevent.
+ */
+// A `type` alias, not an `interface`: TS only synthesizes an implicit index
+// signature for the former, and the registry's dispatch layer casts from
+// `Record<string, unknown>`. An interface here fails that cast.
+export type TransactionEdit = {
+  transaction_id: string;
+  account_id?: string;
+  item_id?: string;
+  name?: string;
+  category_id?: string;
+  note?: string;
+  tag_ids?: string[];
+  type?: TransactionType;
+  reviewed?: boolean;
+  date?: string;
+  amount?: number;
+};
+
+/**
+ * Ceiling on writes in flight at once, shared by every bulk write path.
+ *
+ * Deliberately low: Copilot's API drops offline under sustained load (a
+ * sustained unthrottled cleanup run logs timeouts by the dozen), so a wider fan-out
+ * buys a failed batch, not a faster one. The win from bulk tools is agent
+ * turns, not wall-clock — 200 edits at 5-wide is still ONE tool call. Do not
+ * raise without evidence from a live run.
+ */
+const BULK_WRITE_CONCURRENCY = 5;
+
+/**
+ * Ceiling on edits per update_transactions call.
+ *
+ * Bounds three things at once: how long one MCP call can block, how large the
+ * response can get, and the blast radius of a mistaken batch. At 5-wide and
+ * ~2 writes/sec observed, a full batch runs ~100s. Callers with more work
+ * chunk it — a thousand edits becomes five calls instead of a thousand.
+ */
+const MAX_BULK_EDITS = 200;
+
+/** Fields of a TransactionEdit that actually change the transaction. */
+const EDIT_MUTABLE_KEYS = [
+  'name',
+  'category_id',
+  'note',
+  'tag_ids',
+  'type',
+  'reviewed',
+  'date',
+  'amount',
+] as const;
+
+/**
+ * Every accepted key. The routing ids (account_id/item_id) address the write —
+ * they are not edits, which is why they sit outside EDIT_MUTABLE_KEYS.
+ */
+const EDIT_ALLOWED_KEYS: ReadonlySet<string> = new Set<string>([
+  'transaction_id',
+  'account_id',
+  'item_id',
+  ...EDIT_MUTABLE_KEYS,
+]);
+
+/** GraphQL EditTransactionInput field name → the MCP name we report back. */
+const EDIT_GRAPHQL_TO_API_NAME: Record<string, string> = {
+  name: 'name',
+  categoryId: 'category_id',
+  userNotes: 'note',
+  tagIds: 'tag_ids',
+  isReviewed: 'reviewed',
+  type: 'type',
+  date: 'date',
+  amount: 'amount',
+};
+
+/**
+ * Reject unknown fields (equivalent to JSON Schema additionalProperties:
+ * false, but re-checked here as defense in depth in case a method is called
+ * directly without going through the MCP dispatch layer).
+ */
+function rejectUnknownEditKeys(edit: object, label: string): void {
+  for (const key of Object.keys(edit)) {
+    if (!EDIT_ALLOWED_KEYS.has(key)) {
+      throw new Error(`${label}: unknown field "${key}"`);
+    }
+  }
+}
+
+/** Mutable fields the caller actually set (present and not undefined). */
+function mutableEditKeys(edit: TransactionEdit): string[] {
+  return EDIT_MUTABLE_KEYS.filter((k) => edit[k] !== undefined);
+}
+
+/**
+ * Map MCP fields → EditTransaction input shape. Keyed by presence so an
+ * explicit `note: ""` clears the note and `tag_ids: []` clears all tags.
+ */
+function buildEditInput(edit: TransactionEdit): EditTransactionInput {
+  const input: EditTransactionInput = {};
+  if ('name' in edit && edit.name !== undefined) input.name = edit.name.trim();
+  if ('category_id' in edit && edit.category_id !== undefined) input.categoryId = edit.category_id;
+  if ('note' in edit && edit.note !== undefined) input.userNotes = edit.note;
+  if ('tag_ids' in edit && edit.tag_ids !== undefined) input.tagIds = edit.tag_ids;
+  if ('type' in edit && edit.type !== undefined) input.type = edit.type;
+  if ('reviewed' in edit && edit.reviewed !== undefined) input.isReviewed = edit.reviewed;
+  if ('date' in edit && edit.date !== undefined) input.date = edit.date;
+  if ('amount' in edit && edit.amount !== undefined) input.amount = edit.amount;
+  return input;
+}
+
+/**
+ * Build the optimistic cache patch for one applied edit: writes to the
+ * in-memory cache so a subsequent read returns the new value without needing
+ * refresh_database + re-decode.
+ *
+ * `type` itself isn't mirrored: the local Transaction model stores Plaid's
+ * `transaction_type`/`plaid_transaction_type`, not Copilot's
+ * REGULAR/INCOME/INTERNAL_TRANSFER classification, so there's no field to
+ * patch. Only its side-effect is patchable — INCOME/INTERNAL_TRANSFER clears
+ * the category server-side (verified live), so mirror that so a follow-up read
+ * doesn't show a stale category.
+ */
+function buildEditCachePatch(edit: TransactionEdit): Partial<Transaction> {
+  const patch: Partial<Transaction> = {};
+  if ('name' in edit && edit.name !== undefined) patch.name = edit.name.trim();
+  if ('category_id' in edit && edit.category_id !== undefined) patch.category_id = edit.category_id;
+  if ('note' in edit && edit.note !== undefined) patch.user_note = edit.note;
+  if ('tag_ids' in edit && edit.tag_ids !== undefined) patch.tag_ids = edit.tag_ids;
+  if ('reviewed' in edit && edit.reviewed !== undefined) patch.user_reviewed = edit.reviewed;
+  if ('date' in edit && edit.date !== undefined) patch.date = edit.date;
+  if ('amount' in edit && edit.amount !== undefined) patch.amount = edit.amount;
+  if (edit.type === 'INCOME' || edit.type === 'INTERNAL_TRANSFER') {
+    patch.category_id = '';
+  }
+  return patch;
 }
 
 /**
@@ -2646,6 +2791,187 @@ export class CopilotMoneyTools {
   }
 
   /**
+   * Per-field validation shared by update_transaction and update_transactions.
+   *
+   * Runs BEFORE any write so a rejected edit mutates nothing. `label` prefixes
+   * every message: the singular tool passes its own name so its error strings
+   * are unchanged; the plural passes `update_transactions edits[i]` so a
+   * failure in a 200-row batch names the row that caused it.
+   */
+  private async validateEditFields(edit: TransactionEdit, label: string): Promise<void> {
+    if ('name' in edit && edit.name !== undefined) {
+      const trimmed = edit.name.trim();
+      if (trimmed.length === 0) {
+        throw new Error(`${label}: name must not be empty`);
+      }
+    }
+    if ('category_id' in edit && edit.category_id !== undefined) {
+      validateDocId(edit.category_id, 'category_id');
+      await this.validateCategoryId(edit.category_id);
+    }
+    if ('tag_ids' in edit && edit.tag_ids !== undefined) {
+      for (const tagId of edit.tag_ids) {
+        validateDocId(tagId, 'tag_id');
+      }
+      await this.validateTagIds(edit.tag_ids);
+    }
+    if ('type' in edit && edit.type !== undefined) {
+      if (!TRANSACTION_TYPES.includes(edit.type)) {
+        throw new Error(
+          `${label}: type must be one of ${TRANSACTION_TYPES.join(', ')}. Got: ${edit.type}`
+        );
+      }
+      // Verified live (2026-06-12): setting type=INCOME or INTERNAL_TRANSFER
+      // makes the server silently clear the category (no error). So a
+      // category_id + INCOME/INTERNAL_TRANSFER request is self-contradictory —
+      // the server would drop the category half. Reject it with an accurate
+      // message instead of issuing a write that half-applies.
+      if (
+        (edit.type === 'INCOME' || edit.type === 'INTERNAL_TRANSFER') &&
+        'category_id' in edit &&
+        edit.category_id !== undefined
+      ) {
+        throw new Error(
+          `${label}: category_id cannot be combined with type ${edit.type} — Copilot ` +
+            `clears the category for INCOME/INTERNAL_TRANSFER transactions. Set the type alone ` +
+            `(its category is removed), or use type REGULAR to keep/set a category.`
+        );
+      }
+    }
+    if ('reviewed' in edit && edit.reviewed !== undefined) {
+      if (typeof edit.reviewed !== 'boolean') {
+        throw new Error(`${label}: reviewed must be a boolean. Got: ${String(edit.reviewed)}`);
+      }
+    }
+    if ('date' in edit && edit.date !== undefined) {
+      validateDate(edit.date, 'date');
+    }
+    if ('amount' in edit && edit.amount !== undefined) {
+      if (typeof edit.amount !== 'number' || !Number.isFinite(edit.amount)) {
+        throw new Error(`${label}: amount must be a finite number`);
+      }
+      if (Math.abs(edit.amount) > MAX_VALID_AMOUNT) {
+        throw new Error(
+          `${label}: amount exceeds maximum valid value (${MAX_VALID_AMOUNT}): ${edit.amount}`
+        );
+      }
+    }
+  }
+
+  /**
+   * Structural validation + account/item resolution for a batch of edits.
+   *
+   * Resolution is the reason this is batched: `resolveTransactionMeta` takes
+   * an array and issues at most ONE windowed fetch for every id it can't find
+   * in the meta index, so a 200-edit batch costs the same lookup as a 1-edit
+   * one. Resolving per row would re-fetch the window 200 times.
+   *
+   * Callers supplying BOTH account_id and item_id (from a live read) bypass
+   * resolution entirely for that row — that is how out-of-window transactions
+   * stay writable. Half a pair is always a caller mistake; reject it rather
+   * than silently resolving.
+   */
+  private async resolveEditRoutes(
+    edits: TransactionEdit[],
+    label: (index: number) => string,
+    notFoundSuffix: string
+  ): Promise<Array<{ id: string; accountId: string; itemId: string }>> {
+    const needsResolution: string[] = [];
+    edits.forEach((edit, i) => {
+      if ((edit.account_id === undefined) !== (edit.item_id === undefined)) {
+        throw new Error(
+          `${label(i)}: account_id and item_id must be passed together (both from a live read) to bypass local resolution`
+        );
+      }
+      if (edit.account_id !== undefined && edit.item_id !== undefined) {
+        validateDocId(edit.account_id, 'account_id');
+        validateDocId(edit.item_id, 'item_id');
+      } else {
+        needsResolution.push(edit.transaction_id);
+      }
+    });
+
+    let metaMap = new Map<string, { accountId: string; itemId: string }>();
+    if (needsResolution.length > 0) {
+      const resolved = await this.resolveTransactionMeta(needsResolution);
+      metaMap = resolved.meta;
+      const missing = needsResolution.filter((id) => !metaMap.has(id));
+      if (missing.length > 0) {
+        throw new Error(
+          CopilotMoneyTools.transactionsNotFoundMessage(missing, resolved.liveWindowMonths) +
+            notFoundSuffix
+        );
+      }
+    }
+
+    return edits.map((edit) => {
+      if (edit.account_id !== undefined && edit.item_id !== undefined) {
+        return { id: edit.transaction_id, accountId: edit.account_id, itemId: edit.item_id };
+      }
+      const meta = metaMap.get(edit.transaction_id)!;
+      return { id: edit.transaction_id, accountId: meta.accountId, itemId: meta.itemId };
+    });
+  }
+
+  /**
+   * Run `task` over `entries` with never more than `concurrency` in flight.
+   *
+   * The cap exists to avoid hammering Copilot's API — the server drops
+   * offline under sustained load, so a wide fan-out trades a slow batch for a
+   * failed one. Do not raise it without evidence from a live run.
+   *
+   * Error contract, shared by review_transactions and update_transactions:
+   *  - `stopOnError` true  → on the FIRST failure (chronological, not lowest
+   *    index) no new writes start, in-flight writes settle, and that single
+   *    error is returned. Preserves the pre-existing review_transactions
+   *    behaviour exactly.
+   *  - `stopOnError` false → every entry is attempted and all failures are
+   *    returned in the order they occurred.
+   *
+   * Either way the caller counts its own successes inside `task`, so partial
+   * success is always observable.
+   */
+  private static async runBoundedPool<TEntry>(
+    entries: readonly TEntry[],
+    concurrency: number,
+    stopOnError: boolean,
+    task: (entry: TEntry, index: number) => Promise<void>
+  ): Promise<Array<{ index: number; error: unknown }>> {
+    // The `as` cast is load-bearing under TS strict: a bare `= []` lets
+    // control-flow analysis narrow the element type and forget the annotation,
+    // which then breaks the `instanceof` checks callers run on `.error`.
+    const failures: Array<{ index: number; error: unknown }> = [] as Array<{
+      index: number;
+      error: unknown;
+    }>;
+
+    // pLimit queues FIFO and releases its slot on either settlement, so tasks
+    // start in index order and a rejection never strands the pool. It has no
+    // early-exit of its own — stopOnError is implemented by having each task
+    // check for a recorded failure at the moment it finally gets a slot, which
+    // turns "stop" into "every queued write becomes a no-op" without needing to
+    // cancel anything.
+    const limit = pLimit(concurrency);
+    await Promise.all(
+      entries.map((entry, idx) =>
+        limit(async () => {
+          if (stopOnError && failures.length > 0) return;
+          try {
+            await task(entry, idx);
+          } catch (e) {
+            // Under stopOnError an already-in-flight write can also fail after
+            // the first one was recorded; keep only the first so the error
+            // surfaced to the caller is deterministic.
+            if (stopOnError && failures.length > 0) return;
+            failures.push({ index: idx, error: e });
+          }
+        })
+      )
+    );
+    return failures;
+  }
+
+  /**
    * Update one or more fields on a transaction in a single atomic write.
    *
    * Supported fields: name, category_id, note, tag_ids, type, reviewed.
@@ -2666,19 +2992,7 @@ export class CopilotMoneyTools {
    * Mutation.editTransaction:routing ledger entry), so a wrong pair fails
    * loudly rather than editing a different transaction.
    */
-  async updateTransaction(args: {
-    transaction_id: string;
-    account_id?: string;
-    item_id?: string;
-    name?: string;
-    category_id?: string;
-    note?: string;
-    tag_ids?: string[];
-    type?: TransactionType;
-    reviewed?: boolean;
-    date?: string;
-    amount?: number;
-  }): Promise<{
+  async updateTransaction(args: TransactionEdit): Promise<{
     success: true;
     transaction_id: string;
     updated: string[];
@@ -2686,38 +3000,11 @@ export class CopilotMoneyTools {
     const client = this.getGraphQLClient();
     const { transaction_id } = args;
 
-    // Reject unknown fields (equivalent to JSON Schema additionalProperties: false,
-    // but re-checked here as a defense in depth in case the method is called directly
-    // without going through the MCP dispatch layer).
-    const allowedKeys = new Set([
-      'transaction_id',
-      'account_id',
-      'item_id',
-      'name',
-      'category_id',
-      'note',
-      'tag_ids',
-      'type',
-      'reviewed',
-      'date',
-      'amount',
-    ]);
-    for (const key of Object.keys(args)) {
-      if (!allowedKeys.has(key)) {
-        throw new Error(`update_transaction: unknown field "${key}"`);
-      }
-    }
+    rejectUnknownEditKeys(args, 'update_transaction');
 
     // Require at least one mutable field besides transaction_id. The routing
     // ids (account_id/item_id) address the write — they are not edits.
-    const mutableKeys = Object.keys(args).filter(
-      (k) =>
-        k !== 'transaction_id' &&
-        k !== 'account_id' &&
-        k !== 'item_id' &&
-        (args as Record<string, unknown>)[k] !== undefined
-    );
-    if (mutableKeys.length === 0) {
+    if (mutableEditKeys(args).length === 0) {
       throw new Error('update_transaction requires at least one field to update');
     }
 
@@ -2725,159 +3012,29 @@ export class CopilotMoneyTools {
 
     // Routing bypass: a caller-supplied account_id + item_id pair (from a
     // live read) is forwarded verbatim — no local resolution, so writes can
-    // reach transactions outside the resolution window. Half a pair is
-    // always a caller mistake; reject it rather than silently resolving.
-    if ((args.account_id === undefined) !== (args.item_id === undefined)) {
-      throw new Error(
-        'update_transaction: account_id and item_id must be passed together (both from a live read) to bypass local resolution'
-      );
-    }
-    let resolvedAccountId: string;
-    let resolvedItemId: string;
-    if (args.account_id !== undefined && args.item_id !== undefined) {
-      validateDocId(args.account_id, 'account_id');
-      validateDocId(args.item_id, 'item_id');
-      resolvedAccountId = args.account_id;
-      resolvedItemId = args.item_id;
-    } else {
-      // Resolve the transaction's accountId/itemId for the GraphQL mutation —
-      // live-first via the meta index / windowed fetch; local cache only in
-      // degraded (no-liveDb) mode. See resolveTransactionMeta().
-      const { meta: metaMap, liveWindowMonths } = await this.resolveTransactionMeta([
-        transaction_id,
-      ]);
-      const meta = metaMap.get(transaction_id);
-      if (!meta) {
-        throw new Error(
-          CopilotMoneyTools.transactionsNotFoundMessage([transaction_id], liveWindowMonths) +
-            ' Pass account_id and item_id (from a live read) to write anyway.'
-        );
-      }
-      resolvedAccountId = meta.accountId;
-      resolvedItemId = meta.itemId;
-    }
+    // reach transactions outside the resolution window.
+    const [route] = await this.resolveEditRoutes(
+      [args],
+      () => 'update_transaction',
+      ' Pass account_id and item_id (from a live read) to write anyway.'
+    );
+    const resolvedAccountId = route!.accountId;
+    const resolvedItemId = route!.itemId;
 
     // Per-field validation (runs BEFORE any write for atomicity).
-    if ('name' in args && args.name !== undefined) {
-      const trimmed = args.name.trim();
-      if (trimmed.length === 0) {
-        throw new Error('update_transaction: name must not be empty');
-      }
-    }
-    if ('category_id' in args && args.category_id !== undefined) {
-      validateDocId(args.category_id, 'category_id');
-      await this.validateCategoryId(args.category_id);
-    }
-    if ('tag_ids' in args && args.tag_ids !== undefined) {
-      for (const tagId of args.tag_ids) {
-        validateDocId(tagId, 'tag_id');
-      }
-      await this.validateTagIds(args.tag_ids);
-    }
-    if ('type' in args && args.type !== undefined) {
-      if (!TRANSACTION_TYPES.includes(args.type)) {
-        throw new Error(
-          `update_transaction: type must be one of ${TRANSACTION_TYPES.join(', ')}. Got: ${args.type}`
-        );
-      }
-      // Verified live (2026-06-12): setting type=INCOME or INTERNAL_TRANSFER
-      // makes the server silently clear the category (no error). So a
-      // category_id + INCOME/INTERNAL_TRANSFER request is self-contradictory —
-      // the server would drop the category half. Reject it with an accurate
-      // message instead of issuing a write that half-applies.
-      if (
-        (args.type === 'INCOME' || args.type === 'INTERNAL_TRANSFER') &&
-        'category_id' in args &&
-        args.category_id !== undefined
-      ) {
-        throw new Error(
-          `update_transaction: category_id cannot be combined with type ${args.type} — Copilot ` +
-            `clears the category for INCOME/INTERNAL_TRANSFER transactions. Set the type alone ` +
-            `(its category is removed), or use type REGULAR to keep/set a category.`
-        );
-      }
-    }
-    if ('reviewed' in args && args.reviewed !== undefined) {
-      if (typeof args.reviewed !== 'boolean') {
-        throw new Error(
-          `update_transaction: reviewed must be a boolean. Got: ${String(args.reviewed)}`
-        );
-      }
-    }
-    if ('date' in args && args.date !== undefined) {
-      validateDate(args.date, 'date');
-    }
-    if ('amount' in args && args.amount !== undefined) {
-      if (typeof args.amount !== 'number' || !Number.isFinite(args.amount)) {
-        throw new Error('update_transaction: amount must be a finite number');
-      }
-      if (Math.abs(args.amount) > MAX_VALID_AMOUNT) {
-        throw new Error(
-          `update_transaction: amount exceeds maximum valid value (${MAX_VALID_AMOUNT}): ${args.amount}`
-        );
-      }
-    }
-    // Map MCP fields → EditTransaction input shape.
-    const input: {
-      name?: string;
-      categoryId?: string;
-      userNotes?: string | null;
-      tagIds?: string[];
-      isReviewed?: boolean;
-      type?: TransactionType;
-      date?: string;
-      amount?: number;
-    } = {};
-    if ('name' in args && args.name !== undefined) input.name = args.name.trim();
-    if ('category_id' in args && args.category_id !== undefined)
-      input.categoryId = args.category_id;
-    if ('note' in args && args.note !== undefined) input.userNotes = args.note;
-    if ('tag_ids' in args && args.tag_ids !== undefined) input.tagIds = args.tag_ids;
-    if ('type' in args && args.type !== undefined) input.type = args.type;
-    if ('reviewed' in args && args.reviewed !== undefined) input.isReviewed = args.reviewed;
-    if ('date' in args && args.date !== undefined) input.date = args.date;
-    if ('amount' in args && args.amount !== undefined) input.amount = args.amount;
+    await this.validateEditFields(args, 'update_transaction');
 
     try {
       const result = await editTransaction(client, {
         id: transaction_id,
         accountId: resolvedAccountId,
         itemId: resolvedItemId,
-        input,
+        input: buildEditInput(args),
       });
       // Map GraphQL field names back to MCP API names in the response.
-      const graphqlToApiName: Record<string, string> = {
-        name: 'name',
-        categoryId: 'category_id',
-        userNotes: 'note',
-        tagIds: 'tag_ids',
-        isReviewed: 'reviewed',
-        type: 'type',
-        date: 'date',
-        amount: 'amount',
-      };
-      const updated = Object.keys(result.changed).map((k) => graphqlToApiName[k] ?? k);
+      const updated = Object.keys(result.changed).map((k) => EDIT_GRAPHQL_TO_API_NAME[k] ?? k);
 
-      // Optimistic cache patch: writes to the in-memory cache so a subsequent
-      // read returns the new value without needing refresh_database + re-decode.
-      const patch: Partial<Transaction> = {};
-      if ('name' in args && args.name !== undefined) patch.name = args.name.trim();
-      if ('category_id' in args && args.category_id !== undefined)
-        patch.category_id = args.category_id;
-      if ('note' in args && args.note !== undefined) patch.user_note = args.note;
-      if ('tag_ids' in args && args.tag_ids !== undefined) patch.tag_ids = args.tag_ids;
-      if ('reviewed' in args && args.reviewed !== undefined) patch.user_reviewed = args.reviewed;
-      if ('date' in args && args.date !== undefined) patch.date = args.date;
-      if ('amount' in args && args.amount !== undefined) patch.amount = args.amount;
-      // `type` itself isn't mirrored into the cache: the local Transaction model
-      // stores Plaid's `transaction_type`/`plaid_transaction_type`, not Copilot's
-      // REGULAR/INCOME/INTERNAL_TRANSFER classification, so there's no field to
-      // patch. Only its side-effect is patchable — INCOME/INTERNAL_TRANSFER clears
-      // the category server-side (verified live), so mirror that so a follow-up
-      // read doesn't show a stale category.
-      if (args.type === 'INCOME' || args.type === 'INTERNAL_TRANSFER') {
-        patch.category_id = '';
-      }
+      const patch = buildEditCachePatch(args);
       if (Object.keys(patch).length > 0) {
         this.db.patchCachedTransaction(transaction_id, patch);
         this.liveDb?.patchLiveTransaction(transaction_id, patch);
@@ -2894,6 +3051,164 @@ export class CopilotMoneyTools {
       }
       throw e;
     }
+  }
+
+  /**
+   * Apply many independent transaction edits in one call.
+   *
+   * Why this exists: `update_transaction` writes one row per MCP tool call,
+   * and one tool call costs one agent turn. A cleanup pass over a few hundred
+   * transactions therefore burned a few hundred turns (and re-read the whole
+   * context each time) to issue a few hundred sub-second mutations. The GraphQL
+   * cost was never the problem; the turn count was. This tool collapses N edits
+   * into one call while leaving the per-row write path byte-identical.
+   *
+   * Each entry is the same shape `update_transaction` takes and gets the same
+   * validation, field mapping, and optimistic cache patch — arity is the only
+   * difference.
+   *
+   * Ordering guarantees, in the order they run:
+   *  1. Structural checks + account/item resolution for the WHOLE batch (one
+   *     windowed fetch, not one per row).
+   *  2. Per-field validation for every edit.
+   *  3. Only then does the first write leave the process.
+   * So a malformed edit at index 40 fails the call without edit 0 having been
+   * written. This is the batch-level extension of the singular tool's
+   * "validation runs BEFORE any write for atomicity" property, and it is the
+   * reason validation errors are always all-or-nothing regardless of
+   * `continue_on_error`.
+   *
+   * `continue_on_error` governs GraphQL write failures only:
+   *  - false (default) → first failure stops the batch, matching
+   *    review_transactions. Use when the edits are a coherent unit.
+   *  - true            → every edit is attempted; failures come back in
+   *    `failures[]`. Use for backlog sweeps where a few unwritable rows
+   *    shouldn't strand the rest.
+   * Either way `updated_count` and `results[]` reflect exactly what was
+   * written, so a partial batch is always recoverable — retry the failures,
+   * not the whole set.
+   */
+  async updateTransactions(args: {
+    edits: TransactionEdit[];
+    continue_on_error?: boolean;
+  }): Promise<{
+    success: boolean;
+    updated_count: number;
+    results: Array<{ transaction_id: string; updated: string[] }>;
+    failures: Array<{ transaction_id: string; error: string }>;
+  }> {
+    const client = this.getGraphQLClient();
+    const { edits, continue_on_error = false } = args;
+
+    if (!Array.isArray(edits) || edits.length === 0) {
+      throw new Error('update_transactions: edits must be a non-empty array');
+    }
+    if (edits.length > MAX_BULK_EDITS) {
+      throw new Error(
+        `update_transactions: edits exceeds the maximum batch size (${MAX_BULK_EDITS}): ` +
+          `${edits.length}. Split the work into batches of ${MAX_BULK_EDITS} or fewer.`
+      );
+    }
+
+    const label = (i: number): string => `update_transactions edits[${i}]`;
+
+    // --- Phase 1: structural validation (no network, no writes) ---
+    const seen = new Set<string>();
+    edits.forEach((edit, i) => {
+      if (edit === null || typeof edit !== 'object') {
+        throw new Error(`${label(i)}: must be an object`);
+      }
+      rejectUnknownEditKeys(edit, label(i));
+      if (typeof edit.transaction_id !== 'string') {
+        throw new Error(`${label(i)}: transaction_id is required`);
+      }
+      validateDocId(edit.transaction_id, 'transaction_id');
+      if (mutableEditKeys(edit).length === 0) {
+        throw new Error(`${label(i)} requires at least one field to update`);
+      }
+      // Two edits to the same row would race: the pool runs 5 wide with no
+      // ordering guarantee, so the surviving value would be nondeterministic
+      // and the optimistic cache patch would disagree with the server. Merge
+      // them caller-side instead — one edit can set every field at once.
+      if (seen.has(edit.transaction_id)) {
+        throw new Error(
+          `${label(i)}: duplicate transaction_id ${edit.transaction_id} — ` +
+            'combine the edits for one transaction into a single entry'
+        );
+      }
+      seen.add(edit.transaction_id);
+    });
+
+    // --- Phase 2: routing resolution, batched (one windowed fetch) ---
+    const routes = await this.resolveEditRoutes(
+      edits,
+      label,
+      ' Pass account_id and item_id (from a live read) on those entries to write anyway, or drop them from the batch.'
+    );
+
+    // --- Phase 3: per-field validation for every edit, still before any write ---
+    for (const [i, edit] of edits.entries()) {
+      await this.validateEditFields(edit, label(i));
+    }
+
+    // --- Phase 4: write ---
+    const results: Array<{ transaction_id: string; updated: string[] }> = [];
+    const entries = edits.map((edit, i) => ({ edit, route: routes[i]! }));
+
+    const poolFailures = await CopilotMoneyTools.runBoundedPool(
+      entries,
+      BULK_WRITE_CONCURRENCY,
+      !continue_on_error,
+      async ({ edit, route }) => {
+        const result = await editTransaction(client, {
+          id: route.id,
+          accountId: route.accountId,
+          itemId: route.itemId,
+          input: buildEditInput(edit),
+        });
+        results.push({
+          transaction_id: result.id,
+          updated: Object.keys(result.changed).map((k) => EDIT_GRAPHQL_TO_API_NAME[k] ?? k),
+        });
+        // Patch per success, not once at the end: on a partial batch the cache
+        // must reflect the rows that actually landed and nothing else.
+        const patch = buildEditCachePatch(edit);
+        if (Object.keys(patch).length > 0) {
+          this.db.patchCachedTransaction(route.id, patch);
+          this.liveDb?.patchLiveTransaction(route.id, patch);
+        }
+      }
+    );
+
+    const failures = poolFailures.map(({ index, error }) => ({
+      transaction_id: edits[index]!.transaction_id,
+      error:
+        error instanceof GraphQLError
+          ? graphQLErrorToMcpError(error)
+          : error instanceof Error
+            ? error.message
+            : String(error),
+    }));
+
+    // Stop-on-error is a hard failure: throw so the caller can't mistake a
+    // truncated batch for a completed one. The counts ride along on the message
+    // (same contract as review_transactions) and the successful writes stand.
+    if (!continue_on_error && failures.length > 0) {
+      const failure = failures[0]!;
+      const cause = poolFailures[0]!.error;
+      throw new Error(
+        `update_transactions failed at transaction_id=${failure.transaction_id} ` +
+          `(${results.length}/${edits.length} succeeded): ${failure.error}`,
+        { cause }
+      );
+    }
+
+    return {
+      success: failures.length === 0,
+      updated_count: results.length,
+      results,
+      failures,
+    };
   }
 
   /**

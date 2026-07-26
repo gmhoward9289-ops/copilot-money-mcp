@@ -644,6 +644,80 @@ export const ROUNDTRIP_CHECKS: readonly RoundtripCheck[] = [
     },
   },
   {
+    tool: 'update_transactions',
+    domain: 'transactions',
+    flow: 'create 2 throwaway transactions → apply DIFFERENT edits to each concurrently (name vs note+amount) → verify both persisted independently via re-read (transactions deleted by the cleanup registry)',
+    appliesSurfaces: ['Mutation.editTransaction:applies'],
+    run: async (ctx) => {
+      // What this pins is the EXTERNAL half of the bulk tool: that concurrent
+      // editTransaction mutations against distinct transactions on the same
+      // account each apply their own field set, with no cross-talk and no
+      // last-writer-wins collapse. The client-side half (validation ordering,
+      // the bounded pool, partial-failure accounting) is unit-tested in
+      // tests/tools/update-transactions-batching.test.ts — it needs no live
+      // account and belongs nowhere near one.
+      //
+      // Two fresh throwaway transactions rather than txnA: the bulk path's
+      // whole point is multiple targets, and reusing txnA would leave the
+      // "independently" claim untested. Both are registered for cleanup by
+      // createSmokeTransaction.
+      const [txn1, txn2] = await Promise.all([
+        createSmokeTransaction(ctx, 'bulk-1', 100),
+        createSmokeTransaction(ctx, 'bulk-2', 200),
+      ]);
+
+      const newName = `${ctx.state.marker}-bulk-1-renamed`;
+      const newNote = `${ctx.state.marker} bulk note`;
+      const newAmount = 250;
+
+      await Promise.all([
+        editTransaction(ctx.client, {
+          id: txn1.id,
+          accountId: txn1.accountId,
+          itemId: txn1.itemId,
+          input: { name: newName },
+        }),
+        editTransaction(ctx.client, {
+          id: txn2.id,
+          accountId: txn2.accountId,
+          itemId: txn2.itemId,
+          input: { userNotes: newNote, amount: newAmount },
+        }),
+      ]);
+
+      const [after1, after2] = await Promise.all([
+        readTransactionById(ctx.client, ctx.state.marker, txn1.id),
+        readTransactionById(ctx.client, ctx.state.marker, txn2.id),
+      ]);
+
+      check(after1, `update_transactions: transaction ${txn1.id} missing from re-read`);
+      check(after2, `update_transactions: transaction ${txn2.id} missing from re-read`);
+      check(
+        after1.name === newName,
+        `update_transactions: re-read name is '${after1.name}', expected '${newName}'`
+      );
+      check(
+        after2.userNotes === newNote,
+        `update_transactions: re-read userNotes is '${String(after2.userNotes)}', expected '${newNote}'`
+      );
+      // Sign is server-owned (see create_transaction) — assert magnitude.
+      check(
+        Math.abs(after2.amount) === newAmount,
+        `update_transactions: re-read |amount| is ${String(Math.abs(after2.amount))}, expected ${newAmount}`
+      );
+      // The independence assertion: neither edit leaked onto the other row.
+      check(
+        after1.name !== after2.name,
+        `update_transactions: both transactions ended up named '${after1.name}' — a concurrent edit leaked across rows`
+      );
+      check(
+        Math.abs(after1.amount) === 100,
+        `update_transactions: txn1 |amount| changed to ${String(Math.abs(after1.amount))}, expected the untouched 100`
+      );
+      return undefined;
+    },
+  },
+  {
     tool: 'review_transactions',
     domain: 'transactions',
     flow: 'capture isReviewed on the run-created transaction → flip → verify via re-read → restore original in finally',
