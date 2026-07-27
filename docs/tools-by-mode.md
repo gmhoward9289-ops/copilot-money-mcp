@@ -52,7 +52,8 @@ Enabling `--write` automatically turns on `--live-reads`, so the tools below are
 | Tool | Status | Notes |
 |---|---|---|
 | `create_transaction` | ✅ | |
-| `update_transaction` | ✅ | |
+| `update_transaction` | ✅ | Single row. For more than one, use `update_transactions` |
+| `update_transactions` | ✅ | **Bulk edit** — array of the same edits in one call (max 200, 5 writes in flight). All validation runs before the first write, so a bad entry fails the call without a partial apply |
 | `delete_transaction` | ✅ | |
 | `split_transaction` | ✅ | |
 | `add_transaction_to_recurring` | ✅ | Link an existing transaction to a recurring series |
