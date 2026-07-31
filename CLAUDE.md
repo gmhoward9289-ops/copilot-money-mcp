@@ -50,6 +50,7 @@ src/
 │   └── ...             # Other entity schemas (30+ models)
 ├── tools/
 │   ├── tools.ts        # Base tool implementations (14 read + 19 write)
+│   ├── registry/       # One ToolDefinition per tool: schema + handler + readOnly/live flags
 │   └── live/           # 17 GraphQL-backed live read tools (--live-reads mode)
 ├── utils/
 │   ├── date.ts         # Date period parsing (this_month, last_30_days, etc.)
@@ -60,7 +61,8 @@ src/
 
 ## Key Files
 
-- **`src/tools/tools.ts`** - All 33 base tools (14 read + 19 write) are implemented here as async methods in the `CopilotMoneyTools` class. Read schemas in `createToolSchemas()`, write schemas in `createWriteToolSchemas()`. The 17 live-mode tools live in `src/tools/live/*.ts`.
+- **`src/tools/tools.ts`** - All 33 base tools (14 read + 19 write) are implemented here as async methods in the `CopilotMoneyTools` class. Read schemas in `createToolSchemas()`, write schemas in `createWriteToolSchemas()` — both are pure projections of the registry. The 17 live-mode tools live in `src/tools/live/*.ts`.
+- **`src/tools/registry/`** - One `ToolDefinition` per MCP tool (schema + handler + `readOnly` / `requiresLiveReads` / `swappedOutInLiveMode`), grouped into per-domain modules and collected in `index.ts` as `READ_TOOL_DEFS` / `LIVE_TOOL_DEFS` / `WRITE_TOOL_DEFS`. Since PR #470 (v2.2.1) this is the single source of truth for the tool list, dispatch, and both mode gates.
 - **`src/core/database.ts`** - `CopilotDatabase` class with methods like `getTransactions()`, `getAccounts()`, `getIncome()`, etc.
 - **`src/core/decoder.ts`** - Binary decoder that reads LevelDB files and parses Firestore Protocol Buffers.
 - **`manifest.json`** - MCP bundle metadata for .mcpb packaging.
@@ -72,7 +74,7 @@ src/
 - Zod for runtime validation of all data models
 - ESLint + Prettier enforced via pre-push hook (`bun run check`)
 - Read tools marked with `readOnlyHint: true`, write tools with `readOnlyHint: false`
-- Write tools gated behind `WRITE_TOOLS` set in server.ts, require `--write` CLI flag
+- Write gating is a **per-tool `readOnly: boolean` on each `ToolDefinition`** in `src/tools/registry/*.ts`, not a name list. `src/server.ts` reads that field directly: `handleListTools()` drops `!def.readOnly` tools unless `--write` (`src/server.ts:154`), and `handleCallTool()` refuses to dispatch them (`src/server.ts:181`). Keep `readOnly` and `annotations.readOnlyHint` in agreement. The sibling flags `requiresLiveReads` and `swappedOutInLiveMode` gate the `--live-reads` surface the same way.
 
 ### Testing
 - Bun test runner
@@ -81,11 +83,16 @@ src/
 - Run specific tests: `bun test tests/tools/tools.test.ts`
 
 ### Tool Implementation Pattern
-Each MCP tool follows this pattern:
-1. Define input schema in `createToolSchemas()` (read) or `createWriteToolSchemas()` (write)
-2. Implement async method in `CopilotMoneyTools` class
-3. Register in the tool handlers switch statement in `src/server.ts`
-4. For write tools: add to `WRITE_TOOLS` set in `src/server.ts`
+Every MCP tool is exactly one `ToolDefinition` in the registry (`src/tools/registry/`) —
+schema, handler, and classification in a single object. `src/server.ts` derives its tool
+list, dispatch, write gating, and live-reads gating from that registry, and
+`createToolSchemas()` / `createWriteToolSchemas()` (and through them `sync-manifest` and
+the conformance ledger walk) are projections of it, so there are no parallel lists to keep
+in sync. The pattern:
+1. Implement the async method on `CopilotMoneyTools` in `src/tools/tools.ts` (or on the relevant class under `src/tools/live/` for a live tool)
+2. Add a `defineTool({ schema, handler, readOnly, ... })` in the matching domain module under `src/tools/registry/` (`transactions.ts`, `categories.ts`, `tags.ts`, `recurring.ts`, `budgets-goals.ts`, `investments.ts`, `accounts-system.ts`, `live.ts`)
+3. Export it and add it to `READ_TOOL_DEFS`, `LIVE_TOOL_DEFS`, or `WRITE_TOOL_DEFS` in `src/tools/registry/index.ts` — that array membership *is* the registration; there is no switch statement in `src/server.ts`
+4. Set the classification flags: `readOnly: false` for a write tool (gated by `--write`), `requiresLiveReads: true` for a live tool, `swappedOutInLiveMode: true` on a cache read that a `_live` variant replaces
 5. Run `bun run sync-manifest` to update `manifest.json`
 
 ## Important Notes
@@ -102,10 +109,10 @@ Each MCP tool follows this pattern:
 ## Common Tasks
 
 ### Adding a New Tool
-1. Add schema in `createToolSchemas()` (read) or `createWriteToolSchemas()` (write) in `src/tools/tools.ts`
-2. Implement async method in `CopilotMoneyTools` class
-3. Add case to tool handler switch statement in `src/server.ts`
-4. For write tools: add to `WRITE_TOOLS` set in `src/server.ts`
+1. Implement the async method in the `CopilotMoneyTools` class in `src/tools/tools.ts`
+2. Write the tool schema (name, description, `inputSchema`, `annotations`) — for cache-mode tools it lives next to the definition; live tools keep theirs in a `createLive*ToolSchema()` factory under `src/tools/live/`
+3. Wrap both in `defineTool({ schema, handler, readOnly })` in the matching `src/tools/registry/*.ts` domain module, then add the export to `READ_TOOL_DEFS`, `LIVE_TOOL_DEFS`, or `WRITE_TOOL_DEFS` in `src/tools/registry/index.ts`. Nothing in `src/server.ts` needs editing — listing and dispatch are derived from those arrays
+4. For write tools set `readOnly: false` (this is the `--write` gate) and `annotations.readOnlyHint: false` to match; for live tools set `requiresLiveReads: true`, plus `swappedOutInLiveMode: true` on the cache tool it replaces
 5. Run `bun run sync-manifest` to update and verify `manifest.json`
 6. Add tests in `tests/tools/tools.test.ts`
 
