@@ -1,3 +1,5 @@
+> **Historical — archived, not a live work list.** This audit covered PRs #1–#48; the repo is past #587 and every item below has since been resolved or closed (the `Math.round` → `roundAmount()` migration in item 1, for example, is complete — no currency-rounding `Math.round` call sites remain in `src/tools/`). Kept for reference only.
+
 # Review Audit Plan
 
 **Audit Date:** 2026-01-13
