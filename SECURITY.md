@@ -4,8 +4,15 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 1.x.x   | :white_check_mark: |
+| 2.x.x   | :white_check_mark: |
+| 1.x.x   | :x:                |
 | < 1.0   | :x:                |
+
+Fixes land on the latest 2.x release; there are no backports to earlier
+majors. 1.x is end-of-life — its direct-to-Firestore write path stopped
+working when Copilot deployed server-side type checking (see the 2.0.0
+entry in [CHANGELOG.md](CHANGELOG.md)) — so please upgrade before
+reporting.
 
 ## Reporting a Vulnerability
 
