@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`update_transactions` — bulk transaction edits in one call** ([#587](https://github.com/ignaciohermosillacornejo/copilot-money-mcp/pull/587)). `update_transaction` writes one row per MCP tool call, and for an agent one tool call costs one turn, so a cleanup pass over a few hundred transactions spent a few hundred turns — re-reading its whole context each time — to issue a few hundred sub-second mutations. The GraphQL cost was never the bottleneck; the turn count was. `update_transactions` takes an array of the same edits (`transaction_id` plus any of `name`, `category_id`, `note`, `tag_ids`, `type`, `reviewed`, `date`, `amount`), max 200 per call, writes capped at 5 in flight. Entries are independent, so different transactions may change different fields; two entries for the same `transaction_id` are rejected. **All validation and account/item resolution complete before the first write**, so a malformed entry anywhere fails the call without a partial apply. `continue_on_error` (default `false`) governs write failures only — set it `true` for backlog sweeps and read the per-row rejections back from `failures[]`. `review_transactions` now shares the same bounded write pool, and both are built on the existing `pLimit` util. No new external assumptions: this reuses `Mutation.editTransaction` and `EditTransactionInput`, both already in the conformance ledger.
+
 ## [2.2.2] - 2026-06-14
 
 ### Fixed

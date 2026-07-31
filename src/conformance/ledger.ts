@@ -311,7 +311,11 @@ export const CONFORMANCE_LEDGER: readonly LedgerEntry[] = [
     evidence:
       'Per-value live probes + invalid-value control; gated by scripts/smoke/conformance.ts (issue #421, PR #422)',
     values: TRANSACTION_TYPES,
-    toolParams: ['create_transaction.type', 'update_transaction.type'],
+    toolParams: [
+      'create_transaction.type',
+      'update_transaction.type',
+      'update_transactions.edits[].type',
+    ],
   },
   {
     surface: 'RecurringFrequency',
@@ -378,27 +382,64 @@ export const CONFORMANCE_LEDGER: readonly LedgerEntry[] = [
   responseShape('createTransaction'),
   appliesSurface('createTransaction'),
 
+  // update_transaction (one edit), update_transactions (many), and
+  // review_transactions (isReviewed only) are three arities over the SAME
+  // mutation — none of them adds an external surface. The batching params
+  // (`edits`, `rows`, `transaction_ids`) and the client-side policy knob
+  // (`continue_on_error`) ride on this operation entry because that is what
+  // they parameterise; there is no separate bulk mutation behind them.
+  // (Copilot does expose a real `bulkEditTransactions`, but its input shape is
+  // unreversed and unsafe to probe against a live account — see
+  // docs/graphql-capture/hidden-mutations.md. If it is ever adopted, it needs
+  // its own operation entry; these params would move to it.)
   operation('editTransaction', [
     'update_transaction.transaction_id',
     'update_transaction.account_id',
     'update_transaction.item_id',
+    'update_transactions.edits', // the list arg itself
+    'update_transactions.edits[].transaction_id',
+    'update_transactions.edits[].account_id',
+    'update_transactions.edits[].item_id',
+    'update_transactions.continue_on_error',
     'review_transactions.transaction_ids',
     'review_transactions.rows',
     'review_transactions.rows[].transaction_id',
     'review_transactions.rows[].account_id',
     'review_transactions.rows[].item_id',
   ]),
-  gatedInputField('EditTransactionInput.name', ['update_transaction.name']),
-  gatedInputField('EditTransactionInput.categoryId', ['update_transaction.category_id']),
-  gatedInputField('EditTransactionInput.userNotes', ['update_transaction.note']),
-  gatedInputField('EditTransactionInput.tagIds', ['update_transaction.tag_ids']),
+  gatedInputField('EditTransactionInput.name', [
+    'update_transaction.name',
+    'update_transactions.edits[].name',
+  ]),
+  gatedInputField('EditTransactionInput.categoryId', [
+    'update_transaction.category_id',
+    'update_transactions.edits[].category_id',
+  ]),
+  gatedInputField('EditTransactionInput.userNotes', [
+    'update_transaction.note',
+    'update_transactions.edits[].note',
+  ]),
+  gatedInputField('EditTransactionInput.tagIds', [
+    'update_transaction.tag_ids',
+    'update_transactions.edits[].tag_ids',
+  ]),
   gatedInputField('EditTransactionInput.isReviewed', [
     'review_transactions.reviewed',
     'update_transaction.reviewed',
+    'update_transactions.edits[].reviewed',
   ]),
-  gatedInputField('EditTransactionInput.type', ['update_transaction.type']),
-  gatedInputField('EditTransactionInput.date', ['update_transaction.date']),
-  gatedInputField('EditTransactionInput.amount', ['update_transaction.amount']),
+  gatedInputField('EditTransactionInput.type', [
+    'update_transaction.type',
+    'update_transactions.edits[].type',
+  ]),
+  gatedInputField('EditTransactionInput.date', [
+    'update_transaction.date',
+    'update_transactions.edits[].date',
+  ]),
+  gatedInputField('EditTransactionInput.amount', [
+    'update_transaction.amount',
+    'update_transactions.edits[].amount',
+  ]),
   responseShape('editTransaction'),
   appliesSurface('editTransaction'),
   {
