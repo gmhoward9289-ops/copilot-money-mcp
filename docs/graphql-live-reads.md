@@ -2,7 +2,7 @@
 
 The `--live-reads` CLI flag swaps cache-backed read tools for GraphQL-backed `_live` equivalents that read directly from Copilot's web API. Use it when the local LevelDB cache is missing data for the window you need — most commonly for historical reconciliation like `/amazon-sync` on older years — or whenever you want freshness guarantees the local cache can't give.
 
-The progressive migration off LevelDB is now complete for every entity that has a usable GraphQL endpoint: 13 `_live` tools ship today, covering transactions, accounts, categories, budgets, recurring transactions, holdings, tags, net worth, upcoming recurrings, monthly spend, balance history, investment prices, plus a `refresh_cache` utility. See [`docs/tools-by-mode.md`](./tools-by-mode.md) for the full per-tool inventory and which cache-mode tools `--live-reads` swaps vs. adds alongside.
+The progressive migration off LevelDB is now complete for every entity that has a usable GraphQL endpoint: 17 `_live` tools ship today, covering transactions, accounts, categories, budgets, recurring transactions, holdings, tags, net worth, upcoming recurrings, monthly spend, balance history, investment prices, investment allocation, top movers, aggregated holdings, investment balance, plus a `refresh_cache` utility. See [`docs/tools-by-mode.md`](./tools-by-mode.md) for the full per-tool inventory and which cache-mode tools `--live-reads` swaps vs. adds alongside.
 
 ## Starting with live reads
 
