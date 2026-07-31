@@ -90,6 +90,7 @@ src/
 │   └── ...                  # Other entity schemas (tag, category, etc.)
 ├── tools/
 │   ├── tools.ts             # Base tool implementations (cache reads + writes)
+│   ├── registry/            # One ToolDefinition per tool: schema + handler + mode flags
 │   └── live/                # GraphQL-backed live read tools (--live-reads mode)
 ├── utils/
 │   ├── date.ts              # Date period parsing (this_month, last_30_days, etc.)
@@ -100,10 +101,11 @@ src/
 
 ### Key Files
 
-- **`src/tools/tools.ts`** — All 31 base tools (14 read + 17 write) as async methods in `CopilotMoneyTools`. Read tool schemas in `createToolSchemas()`, write tool schemas in `createWriteToolSchemas()`.
+- **`src/tools/tools.ts`** — All 31 base tools (14 read + 17 write) as async methods in `CopilotMoneyTools`. Read tool schemas in `createToolSchemas()`, write tool schemas in `createWriteToolSchemas()` — both are pure projections of the registry below.
+- **`src/tools/registry/`** — One `ToolDefinition` per MCP tool: schema, handler, and classification (`readOnly`, `requiresLiveReads`, `swappedOutInLiveMode`) in a single object, built with `defineTool()`. Per-domain modules (`transactions.ts`, `categories.ts`, `tags.ts`, `recurring.ts`, `budgets-goals.ts`, `investments.ts`, `accounts-system.ts`, `live.ts`) collected in `index.ts` as `READ_TOOL_DEFS` / `LIVE_TOOL_DEFS` / `WRITE_TOOL_DEFS`. Since PR #470 (v2.2.1) this is the single source of truth — the tool list, dispatch, both mode gates, `sync-manifest`, and the conformance ledger walk are all derived from it, so there are no parallel lists to keep in sync.
 - **`src/core/database.ts`** — `CopilotDatabase` class with 5-minute cache TTL, batch loading via `decodeAllCollectionsIsolated()` (worker thread), and filtered accessors.
 - **`src/core/decoder.ts`** — Binary decoder that reads LevelDB and parses Firestore Protocol Buffers. Decodes 30+ collection paths.
-- **`src/server.ts`** — MCP server with tool routing switch. `WRITE_TOOLS` set gates write operations behind the `--write` flag.
+- **`src/server.ts`** — MCP server. No routing switch and no `WRITE_TOOLS` list: `handleListTools()` filters `ALL_TOOL_DEFS` on the registry's own flags (`src/server.ts:154` drops `readOnly: false` tools without `--write`), `handleCallTool()` re-checks the same flag before dispatch (`src/server.ts:181`), and dispatch is `TOOL_REGISTRY.get(name).handler(...)`.
 - **`manifest.json`** — MCP bundle metadata. Keep in sync with `bun run sync-manifest`.
 
 ## Adding a New Read Tool
@@ -121,9 +123,9 @@ src/
    - Paginate with `slice()` + standard metadata
    - Return `{ count, total_count, offset, has_more, data }`
 
-3. **Schema** — Add to `createToolSchemas()` with `readOnlyHint: true`
+3. **Schema** — Write the tool schema (name, description, `inputSchema`, `annotations`) with `readOnlyHint: true`
 
-4. **Server** — Add a `case` to the switch in `src/server.ts`
+4. **Registry** — Wrap the schema and handler in `defineTool({ schema, handler, readOnly: true })` in the matching `src/tools/registry/*.ts` domain module, then export it and add it to `READ_TOOL_DEFS` in `src/tools/registry/index.ts`. That array membership *is* the registration — `src/server.ts` needs no edit. If the tool has a `_live` counterpart that should replace it under `--live-reads`, also set `swappedOutInLiveMode: true`
 
 5. **Manifest** — Run `bun run sync-manifest` to auto-update
 
@@ -133,8 +135,8 @@ src/
 
 Same as read tools, plus:
 
-1. Schema goes in `createWriteToolSchemas()` (not `createToolSchemas()`)
-2. Add tool name to the `WRITE_TOOLS` set in `src/server.ts`
+1. The `defineTool()` call carries `readOnly: false` (and `annotations.readOnlyHint: false` to match) — that single field *is* the `--write` gate, checked by both `handleListTools()` and `handleCallTool()`
+2. Add the definition to `WRITE_TOOL_DEFS` (not `READ_TOOL_DEFS`) in `src/tools/registry/index.ts`, which is what `createWriteToolSchemas()` projects
 3. Add a per-domain function in `src/core/graphql/` (see `setBudget` in `graphql/budgets.ts` or `editTransaction` in `graphql/transactions.ts` for the pattern)
 4. If the mutation isn't in `operations.generated.ts` yet, capture it under `docs/graphql-capture/` and run `bun run generate:graphql`
 5. Wrap GraphQL errors at the tool boundary with `graphQLErrorToMcpError(e)` so user-facing messages stay stable
@@ -186,8 +188,8 @@ entry with a comment.
 - TypeScript strict mode
 - Zod for runtime validation of all data models
 - ESLint + Prettier enforced via pre-commit hooks
-- Read tools: `readOnlyHint: true`
-- Write tools: `readOnlyHint: false`, gated by `WRITE_TOOLS` set
+- Read tools: `readOnlyHint: true`, and `readOnly: true` on the `ToolDefinition`
+- Write tools: `readOnlyHint: false`, and `readOnly: false` on the `ToolDefinition` — that field is the `--write` gate, and the two must agree
 - Conventional commits (`feat:`, `fix:`, `docs:`, `test:`, `chore:`)
 
 ## Submitting Changes
