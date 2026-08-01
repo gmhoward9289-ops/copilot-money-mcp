@@ -84,4 +84,8 @@ jobs:
         with:
           files: coverage/lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: true
+          # Coverage upload is best-effort: a Codecov outage or a missing
+          # CODECOV_TOKEN secret must not fail an otherwise-green build. The
+          # codecov/patch status check still reports coverage on PRs; set back
+          # to true if a hard upload gate is ever wanted.
+          fail_ci_if_error: false
