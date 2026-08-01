@@ -74,7 +74,7 @@ src/
 - Zod for runtime validation of all data models
 - ESLint + Prettier enforced via pre-push hook (`bun run check`)
 - Read tools marked with `readOnlyHint: true`, write tools with `readOnlyHint: false`
-- Write gating is a **per-tool `readOnly: boolean` on each `ToolDefinition`** in `src/tools/registry/*.ts`, not a name list. `src/server.ts` reads that field directly: `handleListTools()` drops `!def.readOnly` tools unless `--write` (`src/server.ts:154`), and `handleCallTool()` refuses to dispatch them (`src/server.ts:181`). Keep `readOnly` and `annotations.readOnlyHint` in agreement. The sibling flags `requiresLiveReads` and `swappedOutInLiveMode` gate the `--live-reads` surface the same way.
+- Write gating is a **per-tool `readOnly: boolean` on each `ToolDefinition`** in `src/tools/registry/*.ts`, not a name list. `src/server.ts` reads that field directly: `handleListTools()` drops `!def.readOnly` tools unless `--write`, and `handleCallTool()` refuses to dispatch them. Keep `readOnly` and `annotations.readOnlyHint` in agreement. The sibling flags `requiresLiveReads` and `swappedOutInLiveMode` gate the `--live-reads` surface the same way.
 
 ### Testing
 - Bun test runner

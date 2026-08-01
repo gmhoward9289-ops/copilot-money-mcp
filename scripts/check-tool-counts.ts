@@ -18,7 +18,11 @@ import { fileURLToPath } from 'url';
 import { READ_TOOL_DEFS, LIVE_TOOL_DEFS, WRITE_TOOL_DEFS } from '../src/tools/registry/index.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const root = (p: string) => join(__dirname, '..', p);
+// CHECK_TOOL_COUNTS_ROOT lets tests point the checker at a synthetic doc tree
+// (same pattern as CHECK_SKILLS_REPO_ROOT in scripts/check-skills.py). Counts
+// always come from the real registry import above.
+const repoRoot = process.env.CHECK_TOOL_COUNTS_ROOT ?? join(__dirname, '..');
+const root = (p: string) => join(repoRoot, p);
 
 const read = READ_TOOL_DEFS.length;
 const live = LIVE_TOOL_DEFS.length;
@@ -32,7 +36,13 @@ const allTotal = read + live + write;
 const mismatches: string[] = [];
 
 function expectSubstring(file: string, needle: string, label: string): void {
-  const content = readFileSync(root(file), 'utf-8');
+  let content: string;
+  try {
+    content = readFileSync(root(file), 'utf-8');
+  } catch {
+    mismatches.push(`${file}: could not read file (checking "${label}")`);
+    return;
+  }
   if (!content.includes(needle)) {
     mismatches.push(`${file}: missing expected "${label}" text: ${JSON.stringify(needle)}`);
   }
