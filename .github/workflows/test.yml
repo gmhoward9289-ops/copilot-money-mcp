@@ -36,6 +36,9 @@ jobs:
       - name: MCP registry constraints check (server.json)
         run: bun run check:server-json
 
+      - name: Tool count drift check
+        run: bun run check:tool-counts
+
       - name: License check (production deps)
         # Stages package.json only (NOT package-lock.json) and runs
         # npm install --omit=dev to mirror scripts/pack-mcpb.ts exactly, so
@@ -84,7 +87,4 @@ jobs:
         with:
           files: coverage/lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
-          # Coverage upload is best-effort: a Codecov outage or missing token
-          # must not fail an otherwise-green build. Set back to true once a
-          # CODECOV_TOKEN secret is configured, if a hard gate is wanted.
-          fail_ci_if_error: false
+          fail_ci_if_error: true
