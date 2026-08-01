@@ -1,0 +1,133 @@
+/**
+ * Behavioural tests for scripts/check-tool-counts.ts — the `bun run
+ * check:tool-counts` gate that asserts every doc-facing tool count matches the
+ * registry.
+ *
+ * Same pattern as tests/scripts/check-skills.test.ts: synthetic doc trees are
+ * driven through the CHECK_TOOL_COUNTS_ROOT override. Counts always come from
+ * the real registry import inside the script, so the pass case copies the real
+ * doc surfaces into a temp tree and the fail cases corrupt them.
+ */
+import { describe, expect, test } from 'bun:test';
+import { copyFile, mkdtemp, mkdir, rm, readFile, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { READ_TOOL_DEFS } from '../../src/tools/registry/index.js';
+
+const SCRIPT = fileURLToPath(new URL('../../scripts/check-tool-counts.ts', import.meta.url));
+const REAL_REPO = fileURLToPath(new URL('../..', import.meta.url));
+
+const CHECKED_FILES = [
+  'package.json',
+  'README.md',
+  'CLAUDE.md',
+  'docs/index.html',
+  'docs/graphql-live-reads.md',
+];
+
+async function runCheck(root?: string): Promise<{ code: number; stderr: string; stdout: string }> {
+  const env = { ...process.env };
+  delete env.CHECK_TOOL_COUNTS_ROOT;
+  if (root !== undefined) env.CHECK_TOOL_COUNTS_ROOT = root;
+  const proc = Bun.spawn(['bun', SCRIPT], { env, stdout: 'pipe', stderr: 'pipe' });
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  return { code: await proc.exited, stderr, stdout };
+}
+
+/** Copy the real doc surfaces into a fresh temp tree the tests can corrupt. */
+async function makeDocTree(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), 'check-tool-counts-'));
+  await mkdir(join(root, 'docs'), { recursive: true });
+  for (const file of CHECKED_FILES) {
+    await copyFile(join(REAL_REPO, file), join(root, file));
+  }
+  return root;
+}
+
+async function withDocTree(
+  mutate: (root: string) => Promise<void>,
+  assertions: (result: { code: number; stderr: string; stdout: string }) => void
+): Promise<void> {
+  const root = await makeDocTree();
+  try {
+    await mutate(root);
+    assertions(await runCheck(root));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+const read = READ_TOOL_DEFS.length;
+
+describe('check:tool-counts', () => {
+  test('passes against the checked-in docs', async () => {
+    const { code, stdout, stderr } = await runCheck();
+    expect(stderr).toBe('');
+    expect(code).toBe(0);
+    expect(stdout).toContain('Tool counts in sync');
+  });
+
+  test('passes against a faithful copy of the doc surfaces', async () => {
+    await withDocTree(
+      async () => {},
+      ({ code, stdout }) => {
+        expect(code).toBe(0);
+        expect(stdout).toContain('Tool counts in sync');
+      }
+    );
+  });
+
+  test('fails on a corrupted count and names the file and label', async () => {
+    await withDocTree(
+      async (root) => {
+        const pkg = await readFile(join(root, 'package.json'), 'utf-8');
+        await writeFile(
+          join(root, 'package.json'),
+          pkg.replace(`(${read} cache-mode read tools)`, `(${read + 1} cache-mode read tools)`)
+        );
+      },
+      ({ code, stderr }) => {
+        expect(code).toBe(1);
+        expect(stderr).toContain('Tool count check failed');
+        expect(stderr).toContain('package.json');
+        expect(stderr).toContain('cache-mode read tool count');
+        // The remediation footer prints the registry-derived truth.
+        expect(stderr).toContain('Derived from the registry');
+      }
+    );
+  });
+
+  test('reports every mismatch, not just the first', async () => {
+    await withDocTree(
+      async (root) => {
+        for (const file of ['package.json', 'README.md']) {
+          const content = await readFile(join(root, file), 'utf-8');
+          await writeFile(join(root, file), content.replaceAll('cache', 'cachet'));
+        }
+      },
+      ({ code, stderr }) => {
+        expect(code).toBe(1);
+        expect(stderr).toContain('package.json');
+        expect(stderr).toContain('README.md');
+      }
+    );
+  });
+
+  test('reports an unreadable file as a mismatch, not a crash', async () => {
+    await withDocTree(
+      async (root) => {
+        await rm(join(root, 'docs/index.html'));
+      },
+      ({ code, stderr }) => {
+        expect(code).toBe(1);
+        expect(stderr).toContain('docs/index.html: could not read file');
+        expect(stderr).not.toContain('ENOENT');
+      }
+    );
+  });
+});
