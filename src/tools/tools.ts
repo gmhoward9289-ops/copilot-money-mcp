@@ -2884,8 +2884,16 @@ export class CopilotMoneyTools {
         );
       }
       if (edit.account_id !== undefined && edit.item_id !== undefined) {
-        validateDocId(edit.account_id, 'account_id');
-        validateDocId(edit.item_id, 'item_id');
+        // Prefix with the row label like every other per-entry error — a bare
+        // "Invalid account_id" in a 200-row batch doesn't say which row.
+        try {
+          validateDocId(edit.account_id, 'account_id');
+          validateDocId(edit.item_id, 'item_id');
+        } catch (e) {
+          throw new Error(`${label(i)}: ${e instanceof Error ? e.message : String(e)}`, {
+            cause: e,
+          });
+        }
       } else {
         needsResolution.push(edit.transaction_id);
       }
@@ -3158,21 +3166,26 @@ export class CopilotMoneyTools {
     }
 
     // --- Phase 4: write ---
-    const results: Array<{ transaction_id: string; updated: string[] }> = [];
-    const entries = edits.map((edit, i) => ({ edit, route: routes[i]! }));
+    // Keyed by the caller's index, not push order: the pool runs 5 wide, so
+    // completion order is nondeterministic and `results[]` would come back in
+    // a different order for identical input. Sorted back into input order
+    // below.
+    const indexed: Array<{ index: number; transaction_id: string; updated: string[] }> = [];
+    const entries = edits.map((edit, i) => ({ edit, route: routes[i]!, index: i }));
 
     const poolFailures = await CopilotMoneyTools.runBoundedPool(
       entries,
       BULK_WRITE_CONCURRENCY,
       !continue_on_error,
-      async ({ edit, route }) => {
+      async ({ edit, route, index }) => {
         const result = await editTransaction(client, {
           id: route.id,
           accountId: route.accountId,
           itemId: route.itemId,
           input: buildEditInput(edit),
         });
-        results.push({
+        indexed.push({
+          index,
           transaction_id: result.id,
           updated: Object.keys(result.changed).map((k) => EDIT_GRAPHQL_TO_API_NAME[k] ?? k),
         });
@@ -3185,6 +3198,10 @@ export class CopilotMoneyTools {
         }
       }
     );
+
+    const results = indexed
+      .sort((a, b) => a.index - b.index)
+      .map(({ transaction_id, updated }) => ({ transaction_id, updated }));
 
     const failures = poolFailures.map(({ index, error }) => ({
       transaction_id: edits[index]!.transaction_id,
