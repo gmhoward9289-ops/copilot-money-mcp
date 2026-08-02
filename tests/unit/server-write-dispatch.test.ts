@@ -59,6 +59,10 @@ const WRITE_TOOL_SPECS: Record<string, { method: string; args: Record<string, un
     method: 'reviewTransactions',
     args: { transaction_ids: ['txn1'], reviewed: true },
   },
+  update_transactions: {
+    method: 'updateTransactions',
+    args: { edits: [{ transaction_id: 'txn1', category_id: 'food' }] },
+  },
   bulk_edit_transactions: {
     method: 'bulkEditTransactions',
     args: { transaction_ids: ['txn1'], category_id: 'food' },

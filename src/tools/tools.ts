@@ -2920,11 +2920,14 @@ export class CopilotMoneyTools {
    * offline under sustained load, so a wide fan-out trades a slow batch for a
    * failed one. Do not raise it without evidence from a live run.
    *
-   * Error contract, shared by review_transactions and update_transactions:
+   * Error contract (used only by update_transactions — review_transactions
+   * moved to the native bulkEditTransactions single request and does not touch
+   * this pool):
    *  - `stopOnError` true  → on the FIRST failure (chronological, not lowest
    *    index) no new writes start, in-flight writes settle, and that single
-   *    error is returned. Preserves the pre-existing review_transactions
-   *    behaviour exactly.
+   *    error is returned. Entries still queued become no-ops, so the tail of a
+   *    large batch is never written — pinned by the "entries queued behind the
+   *    failure are never written" test.
    *  - `stopOnError` false → every entry is attempted and all failures are
    *    returned in the order they occurred.
    *
@@ -3079,14 +3082,17 @@ export class CopilotMoneyTools {
    * `continue_on_error`.
    *
    * `continue_on_error` governs GraphQL write failures only:
-   *  - false (default) → first failure stops the batch, matching
-   *    review_transactions. Use when the edits are a coherent unit.
+   *  - false (default) → first failure stops the batch: queued entries are
+   *    never written and the call throws. Use when the edits are a coherent
+   *    unit.
    *  - true            → every edit is attempted; failures come back in
    *    `failures[]`. Use for backlog sweeps where a few unwritable rows
    *    shouldn't strand the rest.
-   * Either way `updated_count` and `results[]` reflect exactly what was
-   * written, so a partial batch is always recoverable — retry the failures,
-   * not the whole set.
+   * In continue_on_error mode `updated_count` and `results[]` reflect exactly
+   * what was written, so callers retry `failures[]` rather than the whole set.
+   * In default mode the call THROWS, so the client sees only the error string
+   * and its counts — not `results[]`. Every edit is an absolute assignment, so
+   * re-running the whole batch is safe (hence `idempotentHint: true`).
    */
   async updateTransactions(args: {
     edits: TransactionEdit[];

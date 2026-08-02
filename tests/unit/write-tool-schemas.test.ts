@@ -128,7 +128,11 @@ describe('createWriteToolSchemas', () => {
     expect(plural!.description).toMatch(/add_tag_ids/);
 
     // The other half of the split: four fields have no bulk form at all.
-    expect(plural!.description).toMatch(/name.*note.*date.*amount|name, note, date or amount/);
+    // Anchored on the STEERING sentence, not on any mention of those field
+    // names — the description also enumerates them as accepted fields
+    // ("transaction_id plus any of name, category_id, note, ..."), so a loose
+    // regex matches that enumeration and detects nothing.
+    expect(plural!.description).toMatch(/Copilot cannot bulk-edit/);
   });
 
   test('add_transaction_to_recurring has required shape and annotations', () => {
