@@ -400,6 +400,58 @@ describe('update_transactions partial-failure accounting', () => {
     return { tools: new CopilotMoneyTools(db, client), db };
   }
 
+  test('default: stops — entries queued behind the failure are never written', async () => {
+    // The blast-radius property `continue_on_error: false` actually promises.
+    // Without it, a failure at row 3 of a 200-row batch still writes the other
+    // 197 against real financial data, while the error message ("failed at X,
+    // N/200 succeeded") looks identical to the stopped-early behaviour.
+    //
+    // Structure: 20 edits, 5-wide pool. Entry 0 rejects immediately; entries
+    // 1-4 are slow. By the time a slot frees for entry 5, a failure is on
+    // record, so every queued task must become a no-op. Entries 5..19
+    // therefore must NEVER reach the wire.
+    const ids = Array.from({ length: 20 }, (_, i) => `txn-${String(i).padStart(2, '0')}`);
+    const attempted: string[] = [];
+    const client = {
+      mutate: mock((_op: string, _q: string, vars: any) => {
+        attempted.push(vars.id);
+        if (vars.id === ids[0]) {
+          return Promise.reject(new GraphQLError('USER_ACTION_REQUIRED', 'simulated failure'));
+        }
+        return new Promise((resolve) => setTimeout(() => resolve(echoResponse(vars)), 25));
+      }),
+    } as unknown as GraphQLClient;
+
+    const db = new CopilotDatabase('/nonexistent');
+    (db as any).dbPath = '/fake';
+    (db as any)._transactions = ids.map((id) => ({
+      transaction_id: id,
+      amount: 50,
+      date: '2024-01-15',
+      name: id,
+      category_id: 'food',
+      item_id: 'item1',
+      account_id: 'acct1',
+      tag_ids: [],
+    }));
+    (db as any)._userCategories = [{ category_id: 'food', name: 'Food' }];
+    (db as any)._tags = [];
+    (db as any)._allCollectionsLoaded = true;
+    (db as any)._cacheLoadedAt = Date.now();
+    const tools = new CopilotMoneyTools(db, client);
+
+    await expect(
+      tools.updateTransactions({ edits: ids.map((id) => ({ transaction_id: id, note: 'x' })) })
+    ).rejects.toThrow(/update_transactions failed/);
+
+    // The assertion that matters: the tail was never attempted.
+    const tail = ids.slice(5);
+    const leaked = attempted.filter((id) => tail.includes(id));
+    expect(leaked).toEqual([]);
+    // And the pool never started more than its width before stopping.
+    expect(attempted.length).toBeLessThanOrEqual(5);
+  });
+
   test('default: throws naming the failed id and how many succeeded', async () => {
     const ids = Array.from({ length: 8 }, (_, i) => `txn-0${i + 1}`);
     const { tools } = toolsWithFailure(ids, 'txn-05');

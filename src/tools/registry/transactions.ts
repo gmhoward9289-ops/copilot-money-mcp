@@ -587,9 +587,11 @@ export const updateTransactionsTool = defineTool({
       'anywhere in the batch fails the call without writing anything. Writes then go out via ' +
       'GraphQL with a cap of 5 in flight. `continue_on_error` (default false) controls write ' +
       'failures only: false stops the batch at the first failure and throws with a count of what ' +
-      'succeeded; true attempts every edit and returns the failures in `failures[]`. Either way ' +
-      '`updated_count` and `results[]` reflect exactly what was written, so retry the failures ' +
-      'rather than the whole batch. For marking many transactions reviewed and nothing else, ' +
+      'succeeded; true attempts every edit and returns the failures in `failures[]`. With ' +
+      'continue_on_error the response`s `updated_count` and `results[]` reflect exactly what ' +
+      'was written, so retry `failures[]` rather than the whole batch; in the default mode the ' +
+      'call throws instead, and since every edit is an absolute assignment it is safe to ' +
+      're-run the whole batch. For marking many transactions reviewed and nothing else, ' +
       'review_transactions is cheaper.',
     inputSchema: {
       type: 'object',
