@@ -599,6 +599,11 @@ export const updateTransactionsTool = defineTool({
       properties: {
         edits: {
           type: 'array',
+          // Mirrors the runtime checks so a client can reject an out-of-bounds
+          // batch without a round trip. Runtime remains authoritative — these
+          // bounds are a hint, not the enforcement.
+          minItems: 1,
+          maxItems: 200,
           description:
             'The edits to apply, one entry per transaction. Non-empty, max 200, no duplicate ' +
             'transaction_ids.',

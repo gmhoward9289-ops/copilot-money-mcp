@@ -164,6 +164,62 @@ describe('update_transactions dispatches one EditTransaction per edit', () => {
   });
 });
 
+describe('update_transactions response determinism and error labelling', () => {
+  test('results[] comes back in INPUT order, not completion order', async () => {
+    // The pool runs 5 wide, so completion order is nondeterministic — without
+    // an explicit sort, identical input produces differently-ordered output.
+    // Make later entries finish first and assert the response order still
+    // matches what the caller sent.
+    const ids = Array.from({ length: 10 }, (_, i) => `txn-${String(i).padStart(2, '0')}`);
+    const client = {
+      mutate: mock((_op: string, _q: string, vars: any) => {
+        // Earlier ids resolve slowest, so completion order is reversed.
+        const rank = ids.indexOf(vars.id);
+        const delay = (ids.length - rank) * 4;
+        return new Promise((resolve) => setTimeout(() => resolve(echoResponse(vars)), delay));
+      }),
+    } as unknown as GraphQLClient;
+
+    const db = new CopilotDatabase('/nonexistent');
+    (db as any).dbPath = '/fake';
+    (db as any)._transactions = ids.map((id) => ({
+      transaction_id: id,
+      amount: 50,
+      date: '2024-01-15',
+      name: id,
+      category_id: 'food',
+      item_id: 'item1',
+      account_id: 'acct1',
+      tag_ids: [],
+    }));
+    (db as any)._userCategories = [{ category_id: 'food', name: 'Food' }];
+    (db as any)._tags = [];
+    (db as any)._allCollectionsLoaded = true;
+    (db as any)._cacheLoadedAt = Date.now();
+    const tools = new CopilotMoneyTools(db, client);
+
+    const result = await tools.updateTransactions({
+      edits: ids.map((id) => ({ transaction_id: id, note: 'x' })),
+    });
+
+    expect(result.results.map((r) => r.transaction_id)).toEqual(ids);
+  });
+
+  test('a bad routing id names the edits[i] row, like every other batch error', async () => {
+    const { tools, client } = makeTools(['a', 'b']);
+
+    await expect(
+      tools.updateTransactions({
+        edits: [
+          { transaction_id: 'a', note: 'ok' },
+          { transaction_id: 'b', account_id: 'bad/acct', item_id: 'itemA', note: 'x' },
+        ],
+      })
+    ).rejects.toThrow(/edits\[1\]:.*account_id/);
+    expect(client._calls).toHaveLength(0);
+  });
+});
+
 describe('update_transactions validates the whole batch before any write', () => {
   test('a bad field in the LAST edit prevents the FIRST from being written', async () => {
     const { tools, client } = makeTools(['a', 'b', 'c']);
