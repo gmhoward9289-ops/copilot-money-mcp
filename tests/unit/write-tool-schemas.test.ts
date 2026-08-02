@@ -102,6 +102,35 @@ describe('createWriteToolSchemas', () => {
     expect(deleteTxn!.description).toMatch(/no.*undo|no.*soft-delete/i);
   });
 
+  // Two bulk-edit tools now coexist and do genuinely different things:
+  // update_transactions fans out per-row heterogeneous edits over
+  // editTransaction (all 8 fields); bulk_edit_transactions issues ONE native
+  // request applying ONE edit to many rows (5 fields, tags add/remove only).
+  // An agent has to pick correctly, and the only thing steering it is these
+  // description strings — so pin the cross-references and the one hazard that
+  // silently destroys data if the wrong tool is chosen.
+  test('the two bulk-edit tools cross-reference each other and warn about tag semantics', () => {
+    const schemas = createWriteToolSchemas();
+    const plural = schemas.find((s) => s.name === 'update_transactions');
+    const bulk = schemas.find((s) => s.name === 'bulk_edit_transactions');
+    expect(plural).toBeDefined();
+    expect(bulk).toBeDefined();
+
+    // Each must name the other, or an agent never learns the alternative exists.
+    expect(plural!.description).toMatch(/bulk_edit_transactions/);
+    expect(bulk!.description).toMatch(/update_transactions/);
+
+    // The data-loss hazard: update_transactions.tag_ids REPLACES a row's tag
+    // list, so using it to "add a trip tag" silently drops existing tags.
+    // bulk_edit_transactions.add_tag_ids is additive. If this warning is ever
+    // dropped, the wrong-tool choice becomes silent data loss.
+    expect(plural!.description).toMatch(/REPLACES/);
+    expect(plural!.description).toMatch(/add_tag_ids/);
+
+    // The other half of the split: four fields have no bulk form at all.
+    expect(plural!.description).toMatch(/name.*note.*date.*amount|name, note, date or amount/);
+  });
+
   test('add_transaction_to_recurring has required shape and annotations', () => {
     const atr = createWriteToolSchemas().find((s) => s.name === 'add_transaction_to_recurring');
     expect(atr).toBeDefined();

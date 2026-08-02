@@ -568,10 +568,16 @@ export const updateTransactionsTool = defineTool({
   schema: {
     name: 'update_transactions',
     description:
-      'Apply many independent transaction edits in ONE call — the bulk form of update_transaction. ' +
-      'Use this whenever you are editing more than one transaction (recategorizing a merchant ' +
-      'across months, applying a cleanup batch, retagging a trip): one call of 50 edits replaces ' +
-      '50 calls. Each entry in `edits` takes the same fields as update_transaction ' +
+      'Apply many DIFFERENT transaction edits in ONE call — the per-row bulk form of ' +
+      'update_transaction. Use this when the target rows need DIFFERENT values from each ' +
+      'other, or when the edit touches name, note, date or amount (Copilot cannot bulk-edit ' +
+      'those four at all). If every target gets the IDENTICAL change and it only touches ' +
+      'category/type/reviewed, or adds/removes a tag, prefer bulk_edit_transactions — that is ' +
+      "ONE request instead of N. WARNING on tags: an entry's tag_ids REPLACES that row's " +
+      'whole tag list, so using it to add a trip tag silently drops any tags the row already ' +
+      'had; to add or remove a tag across many rows while keeping their existing tags, use ' +
+      'bulk_edit_transactions with add_tag_ids / remove_tag_ids. ' +
+      'Each entry in `edits` takes the same fields as update_transaction ' +
       '(transaction_id plus any of name, category_id, note, tag_ids, type, reviewed, date, ' +
       'amount), and each is validated identically — including the rule that category_id cannot ' +
       'be combined with type INCOME or INTERNAL_TRANSFER. Entries are independent: different ' +
@@ -733,7 +739,9 @@ export const bulkEditTransactionsTool = defineTool({
       'batch reviewed. Targets come from `transaction_ids` (resolved locally) or `rows` ' +
       '(from a live read, works for out-of-window transactions); `rows` wins when both are ' +
       'given. At least one of category_id, type, reviewed, add_tag_ids, remove_tag_ids must ' +
-      'be provided. IMPORTANT LIMITS: (1) One edit for the whole set — to give different ' +
+      'be provided. If rows need DIFFERENT values from each other, or the edit touches ' +
+      'name/note/date/amount, use update_transactions instead. ' +
+      'IMPORTANT LIMITS: (1) One edit for the whole set — to give different ' +
       'transactions different values, make separate calls. (2) Copilot supports ONLY these ' +
       'five fields in bulk; `name`, `date`, `amount` and `note` are NOT bulk-editable, use ' +
       'update_transaction for those. (3) Tags are add/remove, not replace — there is no bulk ' +
