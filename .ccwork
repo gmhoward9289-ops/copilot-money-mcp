@@ -1,0 +1,5 @@
+{
+  "basePort": 3100,
+  "copy": [".env", ".env.local"],
+  "setup": ["bun install"]
+}
