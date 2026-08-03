@@ -74,11 +74,11 @@ the source material behind `src/core/graphql/operations.generated.ts`.
 - **[graphql-capture/schema/operations.md](graphql-capture/schema/operations.md)** — Index
   of every captured operation with observation counts, linking into `operations/`.
 - **[graphql-capture/operations/queries/](graphql-capture/operations/queries/)** — One
-  file per observed query (33 files: `Transactions`, `Accounts`, `Categories`, `Budgets`,
+  file per observed query (34 files: `Transactions`, `Accounts`, `Categories`, `Budgets`,
   `Recurrings`, `Holdings`, `Networth`, `SecurityPrices`, `TopMovers`, …), each with the
   verbatim document, variables, and response shape.
 - **[graphql-capture/operations/mutations/](graphql-capture/operations/mutations/)** — One
-  file per observed mutation (18 files: `EditTransaction`, `SplitTransaction`,
+  file per observed mutation (19 files: `EditTransaction`, `SplitTransaction`,
   `CreateRecurring`, `EditBudget`, `CreateTag`, …), same treatment.
 - **[graphql-capture/hidden-mutations.md](graphql-capture/hidden-mutations.md)** —
   Mutations that exist on the server but the web app never fires (`splitTransaction`,
